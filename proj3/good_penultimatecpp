@@ -1,0 +1,290 @@
+// FAQ
+
+// 1. Which price should I use when executing an order/trade?
+
+// You should always use the taker price, assuming that price makes for a valid trade.
+
+// 2. What happens when I don't completely fill one order?
+
+// Sometimes an order will be placed, for example, to buy more assets than available in the market, in cases like this it depends if the order is a taker or maker.
+
+// If it is a Taker, all possible trades must occur using that order, if there is still something left and order with the amount left should be added to the list of orders. Notice how when you are making the partial trades, those count as orders, but for smaller amounts. You should also keep track of that.
+
+// If it is a Maker, then this means that the taker order was completely fulfilled, and there is still a part of that maker order open. In this case you should change the original maker offer, wherever you are storing it, maybe a reference can help here. You still have to keep track of the filled order that happened.
+
+#include "exchange.hpp"
+#include <algorithm>
+#include <iterator>
+#include <vector>
+
+void Exchange::MakeDeposit(const std::string &username,
+                           const std::string &asset, int amount) {
+
+  if (Portfolios.count(username)) {
+    Portfolios[username][asset] += amount;
+  } else {
+    Portfolios[username][asset] = amount;
+  }
+}
+
+void Exchange::PrintUserPortfolios(std::ostream &os) const {
+  os << "User Portfolios (in alphabetical order):" << std::endl;
+  for (const auto &[username, assets] : Portfolios) {
+    os << username << "'s Portfolio: ";
+    for (const auto &[asset, amount] : assets) {
+      if (amount) {
+        os << amount << ' ' << asset << ", ";
+      }
+    }
+    os << std::endl;
+  }
+}
+
+bool Exchange::WithdrawalIsPossible(const std::string &username,
+                                    const std::string &asset, int amount) {
+
+  if (Portfolios.count(username)) {
+    const std::map<std::string, int> assets = Portfolios.at(username);
+    if (assets.count(asset)) {
+      const int balance = Portfolios.at(username).at(asset);
+      if ((balance - amount) >= 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool Exchange::MakeWithdrawal(const std::string &username,
+                              const std::string &asset, int amount) {
+
+  if (WithdrawalIsPossible(username, asset, amount)) {
+    Portfolios.at(username).at(asset) -= amount;
+    return true;
+  }
+  return false;
+};
+
+std::vector<Order> Exchange::GetTradeParticipants(Order &taker) {
+  std::vector<Order> filtered;
+  std::copy_if(open_orders.cbegin(), open_orders.cend(),
+               std::back_inserter(filtered), [taker](Order o) {
+                 return (taker.amount) &&
+                        (o.asset == taker.asset) && (o.side != taker.side) &&
+                        ((taker.side == "Buy") ? (o.price <= taker.price)
+                                               : (o.price >= taker.price));
+               });
+  return filtered;
+}
+
+bool Exchange::AddOrder(const Order &order) {
+
+  if (order.side == "Sell") {
+    return AddSellOrder(order);
+  } else {
+    return AddBuyOrder(order);
+  }
+}
+
+bool Exchange::AddBuyOrder(const Order &order) {
+  Order taker(order);
+  if (!WithdrawalIsPossible(taker.username, "USD",
+                            (taker.amount * taker.price))) {
+    return false;
+  }
+  while (GetLowestAsk(taker) != open_orders.end()) {
+    ExecuteTakerBuy(taker);
+  }
+  if (taker.amount) {
+    MakeWithdrawal(taker.username, "USD", (taker.amount * taker.price));
+    open_orders.push_back(taker);
+  }
+  return true;
+}
+
+bool Exchange::AddSellOrder(const Order &order) {
+  Order taker(order);
+  if (!WithdrawalIsPossible(taker.username, taker.asset, taker.amount)) {
+    return false;
+  }
+  while (GetHighestBid(taker) != open_orders.end()) {
+    ExecuteTakerSell(taker);
+  }
+  if (taker.amount) {
+    MakeWithdrawal(taker.username, taker.asset, taker.amount);
+    open_orders.push_back(taker);
+  }
+  return true;
+}
+
+void Exchange::PrintUsersOrders(std::ostream &os) const {
+  os << "Users Orders (in alphabetical order):" << std::endl;
+  for (const auto &[username, assets] : Portfolios) {
+    os << username << "'s Open Orders (in chronological order):" << std::endl;
+    for (const auto &o : open_orders) {
+      if (username == o.username) {
+        os << o << std::endl;
+      }
+    }
+    os << username << "'s Filled Orders (in chronological order):" << std::endl;
+    for (const auto &o : filled_orders) {
+      if (username == o.username) {
+        os << o << std::endl;
+      }
+    }
+  }
+}
+
+void Exchange::PrintTradeHistory(std::ostream &os) const {
+
+  os << "Trade History (in chronological order):" << std::endl;
+  for (const auto &t : trade_history) {
+    os << t.buyer_username << " Bought " << t.amount << " of " << t.asset
+       << " From " << t.seller_username << " for " << t.price << " USD"
+       << std::endl;
+  }
+};
+
+void Exchange::PrintBidAskSpread(std::ostream &os) const {
+
+};
+
+void Exchange::TransactTakerBuy(Order &taker, int usd_payment,
+                                int amount_sold) {
+  auto lowest_seller = GetLowestAsk(taker);
+
+  std::string buyer{taker.username};
+  std::string seller{lowest_seller->username};
+  std::string asset_type{taker.asset};
+
+  MakeWithdrawal(buyer, "USD", usd_payment);
+  MakeDeposit(seller, "USD", usd_payment);
+  MakeDeposit(buyer, asset_type, amount_sold);
+}
+
+void Exchange::TransactTakerSell(Order &taker, int usd_payment,
+                                 int amount_bought) {
+  auto highest_buyer = GetHighestBid(taker);
+
+  std::string seller{taker.username}; 
+  std::string buyer{highest_buyer->username};
+  std::string asset_type{taker.asset};
+
+  MakeWithdrawal(seller, asset_type, amount_bought);
+  MakeDeposit(buyer, asset_type, amount_bought);
+  MakeDeposit(seller, "USD", usd_payment);
+}
+
+void Exchange::ExecuteTakerBuy(Order &taker) {
+  auto lowest_seller = GetLowestAsk(taker);
+  Trade trade;
+
+  std::string buyer{taker.username}, seller{lowest_seller->username};
+  int amount_sold{taker.amount}, usd_payment{(taker.amount * taker.price)};
+
+  trade = {buyer, seller, taker.asset, taker.amount,
+           taker.price};
+
+  // Case 1 : FULL Taker Buy, PARTIAL Maker Sell
+  if (taker.amount < lowest_seller->amount) {
+    TransactTakerBuy(taker, usd_payment, amount_sold);
+    Order partial_sell(
+        {seller, "Sell", taker.asset, taker.amount, taker.price});
+
+    filled_orders.push_back(partial_sell);
+    filled_orders.push_back(taker);
+    trade_history.push_back(trade);
+
+    lowest_seller->amount -= amount_sold;
+    taker.amount = 0;
+  }
+  // Case 2 : FULL Taker Buy, FULL Maker Sell
+  else if (taker.amount == lowest_seller->amount) {
+    TransactTakerBuy(taker, usd_payment, amount_sold);
+    Order complete_sell(
+        {seller, "Sell", taker.asset, taker.amount, taker.price});
+    open_orders.erase(lowest_seller);
+
+    filled_orders.push_back(complete_sell);
+    filled_orders.push_back(taker);
+    trade_history.push_back(trade);
+
+    taker.amount -= amount_sold;
+  }
+  // Case 3 : PARTIAL Taker Buy | FULL Maker Sell
+  else {
+    amount_sold = lowest_seller->amount;
+    usd_payment = (amount_sold * taker.price);
+    trade.amount = amount_sold;
+
+    TransactTakerBuy(taker, usd_payment, amount_sold);
+    Order complete_sell(
+        {seller, "Sell", taker.asset, amount_sold, taker.price});
+    Order partial_buy({buyer, "Buy", taker.asset, amount_sold, taker.price});
+
+    open_orders.erase(lowest_seller);
+    filled_orders.push_back(complete_sell);
+    filled_orders.push_back(partial_buy);
+    trade_history.push_back(trade);
+
+    taker.amount -= amount_sold;
+  }
+}
+
+void Exchange::ExecuteTakerSell(Order &taker) {
+  auto highest_buyer = GetHighestBid(taker);
+  Trade trade;
+
+  std::string seller{taker.username}, buyer{highest_buyer->username};
+  int amount_bought{taker.amount}, usd_payment{(taker.amount * taker.price)};
+
+  trade = {buyer, seller, taker.asset, taker.amount,
+           taker.price}; // trade default
+
+  // Case 1 : FULL Taker Sell, PARTIAL Maker Buy
+  if (taker.amount < highest_buyer->amount) {
+    TransactTakerSell(taker, usd_payment, amount_bought);
+    Order partial_maker_buy(
+        {buyer, "Buy", taker.asset, taker.amount, taker.price});
+
+    filled_orders.push_back(partial_maker_buy);
+    filled_orders.push_back(taker);
+    trade_history.push_back(trade);
+
+    highest_buyer->amount -= amount_bought;
+    taker.amount = 0;
+  }
+  // Case 2 : FULL Taker Sell, FULL Maker Buy
+  else if (taker.amount == highest_buyer->amount) {
+    TransactTakerSell(taker, usd_payment, amount_bought);
+    Order complete_maker_buy(
+        {seller, "Sell", taker.asset, taker.amount, taker.price});
+    
+    open_orders.erase(highest_buyer);
+    filled_orders.push_back(complete_maker_buy);
+    filled_orders.push_back(taker);
+    trade_history.push_back(trade);
+
+    taker.amount -= amount_bought;
+  }
+  // Case 3 : PARTIAL Taker Sell | FULL Maker Buy
+  else {
+    amount_bought = highest_buyer->amount;
+    usd_payment = (amount_bought * taker.price);
+    trade.amount = amount_bought;
+
+    TransactTakerSell(taker, usd_payment, amount_bought);
+    Order complete_buy(
+        {buyer, "Buy", taker.asset, amount_bought, taker.price});
+    Order partial_sell(
+        {seller, "Sell", taker.asset, amount_bought, taker.price});
+
+    open_orders.erase(highest_buyer);
+    filled_orders.push_back(complete_buy);
+    filled_orders.push_back(partial_sell);
+    trade_history.push_back(trade);
+
+    taker.amount -= amount_bought; // taker is a seller; seller amount reduces
+                                   // by how much was bought from them
+  }
+}
